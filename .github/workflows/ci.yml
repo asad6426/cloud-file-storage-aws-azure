@@ -1,0 +1,63 @@
+name: Cloud CI
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://127.0.0.1:5000
+      # Azurite's published development account, not a real credential.
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;TableEndpoint=http://127.0.0.1:10002/devstoreaccount1;"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - run: pip install -r requirements.txt "moto[server]"
+      - name: Start AWS and Azure emulators
+        run: |
+          nohup moto_server -H 127.0.0.1 -p 5000 > moto.log 2>&1 &
+          docker run -d --name azurite -p 10000:10000 -p 10002:10002 \
+            mcr.microsoft.com/azure-storage/azurite \
+            azurite --blobHost 0.0.0.0 --tableHost 0.0.0.0 --skipApiVersionCheck --loose
+          for i in $(seq 1 30); do curl -s http://127.0.0.1:5000 >/dev/null && break; sleep 1; done
+          for i in $(seq 1 30); do curl -s http://127.0.0.1:10000 >/dev/null && break; sleep 1; done
+      - name: Provision AWS resources with Terraform
+        run: |
+          terraform -chdir=terraform fmt -check
+          terraform -chdir=terraform init -input=false
+          terraform -chdir=terraform validate
+          terraform -chdir=terraform apply -input=false -auto-approve -var aws_endpoint=$AWS_ENDPOINT_URL
+          echo "S3_BUCKET=$(terraform -chdir=terraform output -raw bucket)" >> "$GITHUB_ENV"
+          echo "DYNAMODB_TABLE=$(terraform -chdir=terraform output -raw table)" >> "$GITHUB_ENV"
+      - name: Tests on AWS and Azure
+        run: python -m pytest -v | tee pytest.txt
+      - name: Docker image
+        run: docker build -t cloudfiles .
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results
+          path: |
+            pytest.txt
+            moto.log
+          if-no-files-found: ignore

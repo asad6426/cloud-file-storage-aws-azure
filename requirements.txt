@@ -1,0 +1,5 @@
+flask>=3.0,<4
+boto3>=1.34
+azure-storage-blob>=12.19
+azure-data-tables>=12.5
+pytest>=8
